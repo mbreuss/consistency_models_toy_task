@@ -27,14 +27,14 @@ if __name__ == "__main__":
         device='cuda',
         rho=7,
         t_steps_min=100,
-        t_steps=500,
+        t_steps=100,
         ema_rate=0.999,
         n_sampling_steps=n_sampling_steps,
         use_karras_noise_conditioning=True,    
     )
     train_epochs = 2001
-    # chose one of the following toy tasks: 'three_gmm_1D' 'uneven_two_gmm_1D' 'two_gmm_1D'
-    data_manager = DataGenerator('three_gmm_1D')
+    # chose one of the following toy tasks: 'three_gmm_1D' 'uneven_two_gmm_1D' 'two_gmm_1D' 'single_gaussian_1D'
+    data_manager = DataGenerator('single_gaussian_1D')
     samples, cond = data_manager.generate_samples(10000)
     samples = samples.reshape(-1, 1).to(device)
     pbar = tqdm(range(train_epochs))

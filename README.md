@@ -13,9 +13,11 @@ pip install -e .
 
 ### Consistency Model Training
 
-Right now, the continuous time and discrete consistency training (CT) are implemented to train these models without the help of a teacher diffusion model. However, experiments on the toy task already show, that using a diffusion training objective before starting the CT help to stabilize the training process significantly. 
+This repo contains implementations for Consistency Distillation (CD) and Consistency Training (CT). For better performance on Consistenct Training, there exists an option to pretrain the model with an diffusion objective before changing to the CT objective. The usage of a diffusion training objective before starting the CT helps to stabilize the training process significantly. 
 
 To try it out:
+
+- Consistency Distillation: ```cd_main.py```
 
 - Discrete Consisteny Training: ```cm_main.py```
 
@@ -68,7 +70,7 @@ I used 2000 training steps for these results with diffusion pretraining.
 
 ### To Dos
 
- - [ ] Implement Consistency Distillation Training
+ - [x] Implement Consistency Distillation Training
  - [ ] Add new toy tasks
  - [ ] Check conditional training 
  - [ ] Find good hyperaparmeters

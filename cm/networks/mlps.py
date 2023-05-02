@@ -135,7 +135,7 @@ class ConistencyScoreNetwork(nn.Module):
         # to train the conditional model with classifier-free guidance wen need 
         # to 0 out some of the conditional during training with a desrired probability
         # it is usually in the range of 0,1 to 0.2 
-        if self.training:
+        if self.training and cond is not None:
             cond = self.mask_cond(cond)
         # we want to use unconditional sampling during classifier free guidance
         if uncond:

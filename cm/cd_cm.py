@@ -9,7 +9,10 @@ from tqdm import trange
 
 from .utils import *
 from .networks.mlps import ConistencyScoreNetwork
-
+"""
+I decided to seperate the consistency distillation based model from the self-trained
+consistency model fore easier readability.
+"""
 
 
 def ema_eval_wrapper(func):
@@ -28,7 +31,22 @@ def ema_eval_wrapper(func):
     return wrapper
 
 
-class ConsistencyModel(nn.Module):
+def ema_diffusion_eval_wrapper(func):
+    def wrapper(self, *args, **kwargs):
+        # Swap model parameters with EMA parameters
+        model_state_dict = self.diffusion_model.state_dict()
+        ema_state_dict = self.diffusion_ema_params
+        self.diffusion_model.load_state_dict(ema_state_dict)
+        
+        # Call the original function
+        result = func(self, *args, **kwargs)
+        
+        # Swap the parameters back to the original model
+        self.diffusion_model.load_state_dict(model_state_dict)
+        return result
+    return wrapper
+
+class CDConsistencyModel(nn.Module):
 
     def __init__(
             self, 
@@ -38,6 +56,7 @@ class ConsistencyModel(nn.Module):
             sigma_max: float,
             conditioned: bool,
             device: str,
+            simultanous_training: bool = False,
             lr: float = 1e-4,
             rho: int = 7,
             t_steps: int = 100,
@@ -48,7 +67,7 @@ class ConsistencyModel(nn.Module):
             use_karras_noise_conditioning: bool = True,     
             adapted_karras_noise_conditioning: bool = False,
             sigma_sample_density_type: str = 'loglogistic',
-            pre_train_diffusion_on_discrete: bool = False # 'uniform' # 'loglogistic'
+            pre_train_diffusion_on_discrete: bool = False
     ) -> None:
         super().__init__()
         self.ema_rate = ema_rate
@@ -74,7 +93,23 @@ class ConsistencyModel(nn.Module):
             device=device,
             cond_conditional=conditioned
         ).to(device)
+        # now we also need an additional teacher model 
+        self.diffusion_model = ConistencyScoreNetwork(
+            x_dim=1,
+            hidden_dim=128,
+            time_embed_dim=4,
+            cond_dim=1,
+            cond_mask_prob=0.0,
+            num_hidden_layers=4,
+            output_dim=1,
+            device=device,
+            cond_conditional=conditioned
+        ).to(device)
+        
+        self.simultanous_training = simultanous_training
+        # set the EMA parameters of the teacher model to the parameters of the model
         self.ema_params = copy.deepcopy(self.model.state_dict())
+        self.diffusion_ema_params = copy.deepcopy(self.diffusion_model.state_dict())
         # now make sure the target model has the same parameters as the model at the beginning
         self.target_model.load_state_dict(copy.deepcopy(self.model.state_dict()))
         # and make sure the target model is not trainable
@@ -94,7 +129,7 @@ class ConsistencyModel(nn.Module):
         self.use_karras_noise_conditioning = use_karras_noise_conditioning
         self.sigma_sample_density_type = sigma_sample_density_type
         self.optimizer = torch.optim.AdamW(self.model.get_params(), lr=lr, weight_decay=5e-4, betas=(0.9, 0.999))
-        # self.optimizer = torch.optim.RAdam(self.model.get_params(), lr=lr, weight_decay=1e-6)
+        self.diffusion_optimizer = torch.optim.AdamW(self.diffusion_model.get_params(), lr=lr, weight_decay=5e-4, betas=(0.9, 0.999))
         self.epochs = 0
         # in their paper they dont mention the c_in and c_noise conidtioning however in their code they use it
         self.adapted_karras_noise_conditioning = adapted_karras_noise_conditioning
@@ -256,13 +291,14 @@ class ConsistencyModel(nn.Module):
         scales = scales + 1
         return scales
     
-    def train_step(self, x, cond, train_step, max_steps):
+    def consistency_distillation_step(self, x, cond, train_step, max_steps):
         """
-        Performs a training step for the Consistecy Policy.
+        Performs a training step for the Consistency Policy.
 
         Args:
             x (torch.Tensor): The input data to train on.
             cond (torch.Tensor): The conditional data for the input.
+            t_chosen (torch.Tensor): The chosen timesteps for the input.
             train_step (int): The current training step.
             max_steps (int): The maximum number of training steps.
 
@@ -270,7 +306,6 @@ class ConsistencyModel(nn.Module):
             float: The loss for this training step.
         """
         self.model.train()
-        self.target_model.train()
         x = x.to(self.device)
         cond = cond.to(self.device)
         self.optimizer.zero_grad()
@@ -284,7 +319,18 @@ class ConsistencyModel(nn.Module):
         t1 = t[t_idx]
         t2 = t[t_idx + 1]
         # compute the loss
-        loss = self.consistency_loss(x, cond, t1, t2)
+        noise = torch.randn_like(x)
+        x_1 = x + noise * t1
+        x_1_denoised = self.consistency_wrapper(self.model, x_1, cond, t1)
+        
+        # compute the loss for the second timestep
+        # with the ground truth action to compute the gradient
+        x_2 = self.heun_update_step(x_1, t1, t2)
+
+        with torch.no_grad():
+            x_2_denoised = self.consistency_wrapper(self.target_model, x_2, cond, t2)
+        
+        loss = torch.nn.functional.mse_loss(x_1_denoised, x_2_denoised).mean()
         
         loss.backward()
         self.optimizer.step()
@@ -378,7 +424,25 @@ class ConsistencyModel(nn.Module):
 
         return jvp_x, jvp_t  
     
-    def diffusion_train_step(self,  x, cond, train_step, max_steps):
+    def train_step(self, x, cond, train_step, max_steps):
+        """
+        Contains all update steps for the diffusion model and the 
+        consistency policy.
+        """
+        self.model.train()
+        if self.simultanous_training:
+            # first update the diffusion model
+            diffusion_loss = self.diffusion_train_step(x, cond, train_step, max_steps)
+        
+        # next update the consistency policy using the diffusion model
+        cd_loss = self.consistency_distillation_step(x, cond, train_step, max_steps)
+        
+        if self.simultanous_training:
+            return diffusion_loss, cd_loss
+        else:
+            return 0, cd_loss
+        
+    def diffusion_train_step(self, x, cond, train_step, max_steps):
         """
         Computes the training loss and performs a single update step for the score-based model.
 
@@ -391,13 +455,12 @@ class ConsistencyModel(nn.Module):
         - loss.item() (float): the scalar value of the training loss for this batch
 
         """
-        self.model.train()
-        self.target_model.train()
+        self.diffusion_model.train()
         x = x.to(self.device)
         cond = cond.to(self.device)
-        self.optimizer.zero_grad()
+        
         if self.pre_train_diffusion_on_discrete:
-        # next generate the discrete timesteps
+            # next generate the discrete timesteps
             t_steps = self.compute_discrete_timesteps(train_step, max_steps)
             t = torch.tensor([self.sample_discrete_timesteps(i, t_steps) for i in range(t_steps)]).to(self.device)
             t_idx = torch.randint(0, t_steps - 1, (x.shape[0], 1), device=self.device)
@@ -405,11 +468,13 @@ class ConsistencyModel(nn.Module):
             t_chosen = t[t_idx]
         else:
             t_chosen = self.make_sample_density()(shape=(len(x),), device=self.device)
+                
+        self.diffusion_optimizer.zero_grad()
         loss = self.diffusion_loss(x, cond, t_chosen)
         loss.backward()
-        self.optimizer.step()
+        self.diffusion_optimizer.step()
         # first we update the ema weights of self.model
-        self._update_ema_weights()
+        self._update_diffusion_ema_weights()
         return loss.item()
 
     def _update_ema_weights(self):
@@ -429,6 +494,14 @@ class ConsistencyModel(nn.Module):
         """
         state_dict = self.model.state_dict()
         for key, ema_param in self.ema_params.items():
+            ema_param.data = (1 - self.ema_rate) * ema_param.data + self.ema_rate * state_dict[key].data
+    
+    def _update_diffusion_ema_weights(self):
+        """
+        Same as _update_ema_weights but for the diffusion model.
+        """
+        state_dict = self.diffusion_model.state_dict()
+        for key, ema_param in self.diffusion_ema_params.items():
             ema_param.data = (1 - self.ema_rate) * ema_param.data + self.ema_rate * state_dict[key].data
 
     def compute_ema_rate(self, t_steps):
@@ -455,37 +528,6 @@ class ConsistencyModel(nn.Module):
         pred_x = self. sample(x_T, cond, t)
         loss = torch.nn.functional.mse_loss(pred_x, x)
         return loss
-    
-    def consistency_loss(self, x, cond, t1, t2):
-        """
-        Compute the consistency training loss for the given input tensor x, conditioning tensor cond, and the two 
-        discrete timesteps t1 and t2. This method generates a noisy version of x and uses the consistency model to 
-        denoise it at timestep t1. Then, it uses the ground truth action to compute the gradient at timestep t2 
-        to update x. Finally, it uses the target model to denoise x at timestep t2 and computes the MSE loss 
-        between the denoised versions of x at the two timesteps.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape [batch_size, dim].
-            cond (torch.Tensor): Conditioning tensor of shape [batch_size, cond_dim].
-            t1 (torch.Tensor): First discrete timestep tensor of shape [batch_size, 1].
-            t2 (torch.Tensor): Second discrete timestep tensor of shape [batch_size, 1].
-
-        Returns:
-            torch.Tensor: Consistency loss tensor of shape [].
-        """
-        noise = torch.randn_like(x)
-        x_1 = x + noise * t1
-        x_1_denoised = self.consistency_wrapper(self.model, x_1, cond, t1)
-        
-        # compute the loss for the second timestep
-        # with the ground truth action to compute the gradient
-        # x_2 = self.euler_update_step(x_1, t1, t2, x)
-        x_2 = x + noise * t2
-
-        with torch.no_grad():
-            x_2_denoised = self.consistency_wrapper(self.target_model, x_2, cond, t2)
-            
-        return torch.nn.functional.mse_loss(x_1_denoised, x_2_denoised).mean()
     
     def diffusion_loss(self, x, cond, t):
         """
@@ -514,7 +556,7 @@ class ConsistencyModel(nn.Module):
         x_1 = x + noise * append_dims(t, x.ndim)
         c_skip, c_out, c_in = [append_dims(x, 2) for x in self.get_diffusion_scalings(t)]
         t = torch.log(t) / 4
-        model_output = self.model(x_1 * c_in, cond, t)
+        model_output = self.diffusion_model(x_1 * c_in, cond, t)
         target = (x - c_skip * x_1) / c_out
         return (model_output - target).pow(2).mean()
         
@@ -595,7 +637,7 @@ class ConsistencyModel(nn.Module):
             return x
     
     @torch.no_grad()
-    @ema_eval_wrapper
+    @ema_diffusion_eval_wrapper
     def sample_diffusion_euler(self, x_shape, cond, n_sampling_steps=None, return_seq=False):
         """
         Sample from the pre-trained diffusion model using the Euler method. This method is used for sanity checking 
@@ -629,17 +671,20 @@ class ConsistencyModel(nn.Module):
         sampled_x.append(x)
         # iterate over the remaining timesteps
         for i in trange(len(sigmas) - 1, disable=True):
-            denoised = self.diffusion_wrapper(self.model, x, cond, sigmas[i])
-            x = self.euler_update_step(x, sigmas[i], sigmas[i+1], denoised)
+            denoised = self.diffusion_wrapper(self.diffusion_model, x, cond, sigmas[i])
+            d = (x - denoised) / append_dims(sigmas[i], x.ndim)
+            x = x + d * append_dims(sigmas[i+1] - sigmas[i], x.ndim)
             sampled_x.append(x)
         if return_seq:
             return sampled_x
         else:
             return x
-        
-    def euler_update_step(self, x, t1, t2, x0):
+    
+    @ema_diffusion_eval_wrapper
+    @torch.no_grad()   
+    def euler_update_step(self, x, t1, t2):
         """
-        Computes a single update step from the Euler sampler with a ground truth value.
+        Computes a single update step from the Euler sampler with the teacher model
 
         Parameters:
         x (torch.Tensor): The input tensor.
@@ -650,11 +695,39 @@ class ConsistencyModel(nn.Module):
         Returns:
         torch.Tensor: The output tensor after taking the Euler update step.
         """
-        denoiser = x0
-
+        self.diffusion_model.eval()
+        denoiser = self.diffusion_wrapper(self.diffusion_model, x, None, t1)
         d = (x - denoiser) / append_dims(t1, x.ndim)
         samples = x + d * append_dims(t2 - t1, x.ndim)
 
+        return samples
+    
+    @ema_diffusion_eval_wrapper
+    @torch.no_grad()   
+    def heun_update_step(self, x, t1, t2):
+        """
+        Computes a single Heun update step from the Euler sampler with the teacher model
+
+        Parameters:
+        x (torch.Tensor): The input tensor.
+        t1 (torch.Tensor): The initial timestep.
+        t2 (torch.Tensor): The final timestep.
+        x0 (torch.Tensor): The ground truth value used to compute the Euler update step.
+
+        Returns:
+        torch.Tensor: The output tensor after taking the Euler update step.
+        """
+        self.diffusion_model.eval()
+        denoised = self.diffusion_wrapper(self.diffusion_model, x, None, t1)
+        d = (x - denoised) / append_dims(t1, x.ndim)
+        
+        
+        sample_temp = x + d * append_dims(t2 - t1, x.ndim)
+        denoised_2 = self.diffusion_wrapper(self.diffusion_model, sample_temp, None, t2)
+        d_2 = (sample_temp - denoised_2) / append_dims(t2, x.ndim)
+        d_prime = (d + d_2) / 2
+        samples = x + d_prime * append_dims(t2 - t1, x.ndim)
+        
         return samples
     
     def update_target_network(self):
@@ -755,7 +828,6 @@ class ConsistencyModel(nn.Module):
         return d
     
     
-
 def update_ema(target_params, source_params, rate=0.999):
     """
     Update target parameters to be closer to those of source parameters using
