@@ -7,7 +7,7 @@ Minimal unofficial implementation of consistency models (CM) proposed by Song et
 
 ```bash
 
-sh install.sh
+pip install -e .
 
 ```
 
